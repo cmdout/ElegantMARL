@@ -6,7 +6,7 @@ import numpy as np
 from agent.AgentPPO import AgentPPO
 from agent.net import CriticPPO
 from envs.env_tool import check
-from train.config import Config
+from HASAC_Train.config import Config
 
 
 class AgentHAPPO():

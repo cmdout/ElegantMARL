@@ -4,7 +4,7 @@ from torch import Tensor
 
 from agent.AgentBase import AgentBase
 from agent.net import ActorPPO
-from train.config import Config
+from HASAC_Train.config import Config
 
 
 class AgentPPO(AgentBase):

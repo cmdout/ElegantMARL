@@ -8,10 +8,10 @@ from copy import deepcopy
 from multiprocessing import Process, Pipe
 
 from buffer.replay_buffer import HAReplayBuffer
-from train.config import Config, build_env
+from HASAC_Train.config import Config, build_env
 import pdb
 
-from train.evaluator import Evaluator, get_cumulative_rewards_and_steps
+from HASAC_Train.evaluator import Evaluator, get_cumulative_rewards_and_steps
 
 if os.name == 'nt':  # if is WindowOS (Windows NT)
     """Fix bug about Anaconda in WindowOS
@@ -140,7 +140,7 @@ class Learner(Process):
 
             '''agent update network using training data'''
             torch.set_grad_enabled(True)
-            pdb.set_trace()
+            #pdb.set_trace()
             logging_tuple = agent.update_net(buffer)
             torch.set_grad_enabled(False)
 
