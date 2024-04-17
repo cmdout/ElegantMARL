@@ -2,7 +2,10 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.distributions.normal import Normal
+from torch.distributions import Bernoulli, Categorical
+from common.util import DiagGaussian, init
+
+from envs.env_tool import check, get_shape_from_obs_space
 
 """Actor (policy network)"""
 
@@ -242,3 +245,456 @@ class ConvNet(nn.Module):  # pixel-level state encoder
         print(image.shape)
         output = net(image)
         print(output.shape)
+
+
+
+
+"""MARL (CTDE: Centralized Training with Decentralized Execution)"""
+
+
+class ActorMAPPO(nn.Module):
+    """
+    Actor network class for MAPPO. Outputs actions given observations.
+
+    :param args: (argparse.Namespace) arguments containing relevant model information.
+    :param obs_space: (gym.Space) observation space.
+    :param action_space: (gym.Space) action space.
+    :param device: (torch.device) specifies the device to run on (cpu/gpu).
+    """
+
+    def __init__(self, args, obs_space, action_space, device=torch.device("cpu")):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+
+        self._gain = args.gain
+        self._use_orthogonal = args.use_orthogonal
+        self._use_policy_active_masks = args.use_policy_active_masks
+        self.tpdv = dict(dtype=torch.float32, device=device)
+
+        obs_shape = get_shape_from_obs_space(obs_space)
+        base = MLPBase
+        self.base = base(args, obs_shape)
+
+        self.act = ACTLayer(
+            action_space, self.hidden_size, self._use_orthogonal, self._gain
+        )
+
+        self.to(device)
+
+    def forward(
+        self, obs, rnn_states, masks, available_actions=None, deterministic=False
+    ):
+        """
+        Compute actions from the given inputs.
+
+        :param obs: [tensor] observation inputs into network.
+        :param rnn_states: [tensor] if RNN network, hidden states for RNN.
+        :param masks: [tensor] mask tensor denoting if hidden states should be reinitialized to zeros.
+        :param available_actions: [tensor] denotes which actions are available to agent (if None, all actions available)
+        :param deterministic: (bool) whether to sample from action distribution or return the mode.
+
+        :return actions: (torch.Tensor) actions to take.
+        :return action_log_probs: (torch.Tensor) log probabilities of taken actions.
+        :return rnn_states: (torch.Tensor) updated RNN hidden states.
+        """
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        actor_features = self.base(obs)
+
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+
+        actions, action_log_probs = self.act(
+            actor_features, available_actions, deterministic
+        )
+
+        return actions, action_log_probs, rnn_states
+
+    def evaluate_actions(
+        self, obs, rnn_states, action, masks, available_actions=None, active_masks=None
+    ):
+        """
+        Compute log probability and entropy of given actions.
+
+        :param obs: (torch.Tensor) observation inputs into network.
+        :param action: (torch.Tensor) actions whose entropy and log probability to evaluate.
+        :param rnn_states: (torch.Tensor) if RNN network, hidden states for RNN.
+        :param masks: (torch.Tensor) mask tensor denoting if hidden states should be reinitialized to zeros.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+        :param active_masks: (torch.Tensor) denotes whether an agent is active or dead.
+        :return action_log_probs: (torch.Tensor) log probabilities of the input actions.
+        :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
+        """
+        obs = check(obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        action = check(action).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+        if available_actions is not None:
+            available_actions = check(available_actions).to(**self.tpdv)
+
+        if active_masks is not None:
+            active_masks = check(active_masks).to(**self.tpdv)
+
+        actor_features = self.base(obs)
+
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
+
+        action_log_probs, dist_entropy = self.act.evaluate_actions(
+            actor_features,
+            action,
+            available_actions,
+            active_masks=active_masks if self._use_policy_active_masks else None,
+        )
+
+        return action_log_probs, dist_entropy
+
+
+class CriticMAPPO(nn.Module):
+    """
+    Critic network class for MAPPO. Outputs value function predictions given centralized input (MAPPO) or local observations (IPPO).
+
+    :param args: (argparse.Namespace) arguments containing relevant model information.
+    :param cent_obs_space: (gym.Space) (centralized) observation space.
+    :param device: (torch.device) specifies the device to run on (cpu/gpu).
+    """
+
+    def __init__(self, args, cent_obs_space, device=torch.device("cpu")):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self._use_orthogonal = args.use_orthogonal
+        self._use_popart = args.use_popart
+        self.tpdv = dict(dtype=torch.float32, device=device)
+        init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][
+            self._use_orthogonal
+        ]
+
+        cent_obs_shape = get_shape_from_obs_space(cent_obs_space)
+        base = MLPBase
+        self.base = base(args, cent_obs_shape)
+
+        def init_(m):
+            return init(m, init_method, lambda x: nn.init.constant_(x, 0))
+
+        self.v_out = init_(nn.Linear(self.hidden_size, 1))
+
+        self.to(device)
+
+    def forward(self, cent_obs, rnn_states, masks):
+        """
+        Compute actions from the given inputs.
+
+        :param cent_obs: [tensor] observation inputs into network.
+        :param rnn_states: [tensor] if RNN network, hidden states for RNN.
+        :param masks: [tensor] mask tensor denoting if RNN states should be reinitialized to zeros.
+        :return values: (torch.Tensor) value function predictions.
+        :return rnn_states: (torch.Tensor) updated RNN hidden states.
+        """
+        cent_obs = check(cent_obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(**self.tpdv)
+        masks = check(masks).to(**self.tpdv)
+
+        critic_features = self.base(cent_obs)
+        if self._use_naive_recurrent_policy or self._use_recurrent_policy:
+            critic_features, rnn_states = self.rnn(critic_features, rnn_states, masks)
+        values = self.v_out(critic_features)
+
+        return values, rnn_states
+
+
+class ACTLayer(nn.Module):
+    """
+    MLP Module to compute actions.
+    :param action_space: (gym.Space) action space.
+    :param inputs_dim: (int) dimension of network input.
+    :param use_orthogonal: (bool) whether to use orthogonal initialization.
+    :param gain: (float) gain of the output layer of the network.
+    """
+
+    def __init__(self, action_space, inputs_dim, use_orthogonal, gain, args=None):
+        super(ACTLayer, self).__init__()
+        self.mixed_action = False
+        self.multi_discrete = False
+        self.mujoco_box = False
+        self.action_type = action_space.__class__.__name__
+
+        if action_space.__class__.__name__ == "Discrete":
+            action_dim = action_space.n
+            self.action_out = Categorical(inputs_dim, action_dim, use_orthogonal, gain)
+        elif action_space.__class__.__name__ == "Box":
+            self.mujoco_box = True
+            action_dim = action_space.shape[0]
+            self.action_out = DiagGaussian(inputs_dim, action_dim, use_orthogonal, gain)
+        elif action_space.__class__.__name__ == "MultiBinary":
+            action_dim = action_space.shape[0]
+            self.action_out = Bernoulli(inputs_dim, action_dim, use_orthogonal, gain)
+        elif action_space.__class__.__name__ == "MultiDiscrete":
+            self.multi_discrete = True
+            action_dims = action_space.high - action_space.low + 1
+            self.action_outs = []
+            for action_dim in action_dims:
+                self.action_outs.append(Categorical(inputs_dim, action_dim, use_orthogonal, gain))
+            self.action_outs = nn.ModuleList(self.action_outs)
+        else:  # discrete + continous
+            self.mixed_action = True
+            continous_dim = action_space[0].shape[0]
+            discrete_dim = action_space[1].n
+            self.action_outs = nn.ModuleList(
+                [DiagGaussian(inputs_dim, continous_dim, use_orthogonal, gain), Categorical(
+                    inputs_dim, discrete_dim, use_orthogonal, gain)])
+
+    def forward(self, x, available_actions=None, deterministic=False):
+        """
+        Compute actions and action logprobs from given input.
+        :param x: (torch.Tensor) input to network.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+                                  (if None, all actions available)
+        :param deterministic: (bool) whether to sample from action distribution or return the mode.
+
+        :return actions: (torch.Tensor) actions to take.
+        :return action_log_probs: (torch.Tensor) log probabilities of taken actions.
+        """
+        if self.mixed_action:
+            actions = []
+            action_log_probs = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                action = action_logit.mode() if deterministic else action_logit.sample()
+                action_log_prob = action_logit.log_probs(action)
+                actions.append(action.float())
+                action_log_probs.append(action_log_prob)
+
+            actions = torch.cat(actions, -1)
+            action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+
+        elif self.multi_discrete:
+            actions = []
+            action_log_probs = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                action = action_logit.mode() if deterministic else action_logit.sample()
+                action_log_prob = action_logit.log_probs(action)
+                actions.append(action)
+                action_log_probs.append(action_log_prob)
+
+            actions = torch.cat(actions, -1)
+            action_log_probs = torch.cat(action_log_probs, -1)
+
+        elif self.mujoco_box:
+            action_logits = self.action_out(x)
+            actions = action_logits.mode() if deterministic else action_logits.sample()
+            action_log_probs = action_logits.log_probs(actions)
+
+        else:
+            action_logits = self.action_out(x, available_actions)
+            actions = action_logits.mode() if deterministic else action_logits.sample()
+            action_log_probs = action_logits.log_probs(actions)
+
+        return actions, action_log_probs
+
+    def get_probs(self, x, available_actions=None):
+        """
+        Compute action probabilities from inputs.
+        :param x: (torch.Tensor) input to network.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+                                  (if None, all actions available)
+
+        :return action_probs: (torch.Tensor)
+        """
+        if self.mixed_action or self.multi_discrete:
+            action_probs = []
+            for action_out in self.action_outs:
+                action_logit = action_out(x)
+                action_prob = action_logit.probs
+                action_probs.append(action_prob)
+            action_probs = torch.cat(action_probs, -1)
+        else:
+            action_logits = self.action_out(x, available_actions)
+            action_probs = action_logits.probs
+
+        return action_probs
+
+    def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
+        """
+        Compute log probability and entropy of given actions.
+        :param x: (torch.Tensor) input to network.
+        :param action: (torch.Tensor) actions whose entropy and log probability to evaluate.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+                                                              (if None, all actions available)
+        :param active_masks: (torch.Tensor) denotes whether an agent is active or dead.
+
+        :return action_log_probs: (torch.Tensor) log probabilities of the input actions.
+        :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
+        """
+        if self.mixed_action:
+            a, b = action.split((2, 1), -1)
+            b = b.long()
+            action = [a, b]
+            action_log_probs = []
+            dist_entropy = []
+            for action_out, act in zip(self.action_outs, action):
+                action_logit = action_out(x)
+                action_log_probs.append(action_logit.log_probs(act))
+                if active_masks is not None:
+                    if len(action_logit.entropy().shape) == len(active_masks.shape):
+                        dist_entropy.append((action_logit.entropy() * active_masks).sum() / active_masks.sum())
+                    else:
+                        dist_entropy.append(
+                            (action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
+                else:
+                    dist_entropy.append(action_logit.entropy().mean())
+
+            action_log_probs = torch.sum(torch.cat(action_log_probs, -1), -1, keepdim=True)
+            dist_entropy = dist_entropy[0] / 2.0 + dist_entropy[1] / 0.98  # ! dosen't make sense
+
+        elif self.multi_discrete:
+            action = torch.transpose(action, 0, 1)
+            action_log_probs = []
+            dist_entropy = []
+            for action_out, act in zip(self.action_outs, action):
+                action_logit = action_out(x)
+                action_log_probs.append(action_logit.log_probs(act))
+                if active_masks is not None:
+                    dist_entropy.append((action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
+                else:
+                    dist_entropy.append(action_logit.entropy().mean())
+
+            action_log_probs = torch.cat(action_log_probs, -1)  # ! could be wrong
+            dist_entropy = sum(dist_entropy) / len(dist_entropy)
+
+        elif self.mujoco_box:
+            action_logits = self.action_out(x)
+            action_log_probs = action_logits.log_probs(action)
+            if active_masks is not None:
+                dist_entropy = (action_logits.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum()
+            else:
+                dist_entropy = action_logits.entropy().mean()
+
+        else:
+            action_logits = self.action_out(x, available_actions)
+            action_log_probs = action_logits.log_probs(action)
+            if active_masks is not None:
+                dist_entropy = (action_logits.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum()
+            else:
+                dist_entropy = action_logits.entropy().mean()
+
+        return action_log_probs, dist_entropy
+
+    def evaluate_actions_trpo(self, x, action, available_actions=None, active_masks=None):
+        """
+        Compute log probability and entropy of given actions.
+        :param x: (torch.Tensor) input to network.
+        :param action: (torch.Tensor) actions whose entropy and log probability to evaluate.
+        :param available_actions: (torch.Tensor) denotes which actions are available to agent
+                                                              (if None, all actions available)
+        :param active_masks: (torch.Tensor) denotes whether an agent is active or dead.
+
+        :return action_log_probs: (torch.Tensor) log probabilities of the input actions.
+        :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
+        """
+
+        if self.multi_discrete:
+            action = torch.transpose(action, 0, 1)
+            action_log_probs = []
+            dist_entropy = []
+            mu_collector = []
+            std_collector = []
+            probs_collector = []
+            for action_out, act in zip(self.action_outs, action):
+                action_logit = action_out(x)
+                mu = action_logit.mean
+                std = action_logit.stddev
+                action_log_probs.append(action_logit.log_probs(act))
+                mu_collector.append(mu)
+                std_collector.append(std)
+                probs_collector.append(action_logit.logits)
+                if active_masks is not None:
+                    dist_entropy.append((action_logit.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum())
+                else:
+                    dist_entropy.append(action_logit.entropy().mean())
+            action_mu = torch.cat(mu_collector, -1)
+            action_std = torch.cat(std_collector, -1)
+            all_probs = torch.cat(probs_collector, -1)
+            action_log_probs = torch.cat(action_log_probs, -1)
+            dist_entropy = torch.tensor(dist_entropy).mean()
+
+        else:
+            action_logits = self.action_out(x, available_actions)
+            action_mu = action_logits.mean
+            action_std = action_logits.stddev
+            action_log_probs = action_logits.log_probs(action)
+            if self.action_type == "Discrete":
+                all_probs = action_logits.logits
+            else:
+                all_probs = None
+            if active_masks is not None:
+                if self.action_type == "Discrete":
+                    dist_entropy = (action_logits.entropy() * active_masks.squeeze(-1)).sum() / active_masks.sum()
+                else:
+                    dist_entropy = (action_logits.entropy() * active_masks).sum() / active_masks.sum()
+            else:
+                dist_entropy = action_logits.entropy().mean()
+
+        return action_log_probs, dist_entropy, action_mu, action_std, all_probs
+
+
+"""MLP modules."""
+
+
+class MLPLayer(nn.Module):
+    def __init__(self, input_dim, hidden_size, layer_N, use_orthogonal, use_ReLU):
+        super(MLPLayer, self).__init__()
+        self._layer_N = layer_N
+
+        active_func = [nn.Tanh(), nn.ReLU()][use_ReLU]
+        init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][use_orthogonal]
+        gain = nn.init.calculate_gain(['tanh', 'relu'][use_ReLU])
+
+        def init_(m):
+            return init(m, init_method, lambda x: nn.init.constant_(x, 0), gain=gain)
+
+        self.fc1 = nn.Sequential(
+            init_(nn.Linear(input_dim, hidden_size)), active_func, nn.LayerNorm(hidden_size))
+        # self.fc_h = nn.Sequential(init_(
+        #     nn.Linear(hidden_size, hidden_size)), active_func, nn.LayerNorm(hidden_size))
+        # self.fc2 = get_clones(self.fc_h, self._layer_N)
+        self.fc2 = nn.ModuleList([nn.Sequential(init_(
+            nn.Linear(hidden_size, hidden_size)), active_func, nn.LayerNorm(hidden_size)) for i in range(self._layer_N)])
+
+    def forward(self, x):
+        x = self.fc1(x)
+        for i in range(self._layer_N):
+            x = self.fc2[i](x)
+        return x
+
+
+class MLPBase(nn.Module):
+    def __init__(self, args, obs_shape, cat_self=True, attn_internal=False):
+        super(MLPBase, self).__init__()
+
+        self._use_feature_normalization = args.use_feature_normalization
+        self._use_orthogonal = args.use_orthogonal
+        self._use_ReLU = args.use_ReLU
+        self._stacked_frames = args.stacked_frames
+        self._layer_N = args.layer_N
+        self.hidden_size = args.hidden_size
+
+        obs_dim = obs_shape[0]
+
+        if self._use_feature_normalization:
+            self.feature_norm = nn.LayerNorm(obs_dim)
+
+        self.mlp = MLPLayer(obs_dim, self.hidden_size,
+                              self._layer_N, self._use_orthogonal, self._use_ReLU)
+
+    def forward(self, x):
+        if self._use_feature_normalization:
+            x = self.feature_norm(x)
+
+        x = self.mlp(x)
+
+        return x
