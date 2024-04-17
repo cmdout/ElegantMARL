@@ -15,3 +15,12 @@ def check_action_env(action):
     for i in range(len(action)):
         output.append(action[i].detach().cpu().numpy())
     return output
+
+def get_shape_from_obs_space(obs_space):
+    if obs_space.__class__.__name__ == "Box":
+        obs_shape = obs_space.shape
+    elif obs_space.__class__.__name__ == "list":
+        obs_shape = obs_space
+    else:
+        raise NotImplementedError
+    return obs_shape
