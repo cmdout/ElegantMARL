@@ -4,7 +4,7 @@ import torch
 from typing import Tuple
 from torch import Tensor
 
-from train.config import Config
+from HASAC_Train.config import Config
 
 
 class HAReplayBuffer:  # for off-policy

@@ -2,7 +2,6 @@ import copy
 import importlib
 import logging
 from envs.env_tool import check_action_env
-import numpy as np
 import supersuit as ss
 
 logging.basicConfig()
@@ -10,9 +9,9 @@ logging.getLogger().setLevel(logging.ERROR)
 
 
 class PettingZooMPEEnv:
-    def __init__(self, continuous_actions=True, scenario='simple_spread_v2', num_envs=1):
-        self.args = {'continuous_actions': continuous_actions, "scenario": scenario}
-        self.scenario = scenario
+    def __init__(self, args):
+        self.args = copy.deepcopy(args)
+        self.scenario = args["scenario"]
         del self.args["scenario"]
         self.discrete = True
         if (
@@ -35,7 +34,7 @@ class PettingZooMPEEnv:
         self.env_name = self.scenario
         self.agents = self.env.agents
         self.agent_num = self.env.num_agents
-        self.num_envs = num_envs # the number of sub env is greater than 1 in vectorized env.
+        self.num_envs = 1 # the number of sub env is greater than 1 in vectorized env.
         self.max_step = self.max_cycles  # the max step number of an episode.
         self.share_observation_space = self.repeat(self.env.state_space)
         self.observation_space = self.unwrap(self.env.observation_spaces)
@@ -51,7 +50,7 @@ class PettingZooMPEEnv:
         """
         return local_obs, global_state, rewards, dones, infos, available_actions
         """
-        actions = check_action_env(actions)
+        # actions = check_action_env(actions)
         if self.discrete:
             obs, rew, term, trunc, info = self.env.step(self.wrap(actions.flatten()))
         else:
@@ -85,7 +84,7 @@ class PettingZooMPEEnv:
     def get_avail_actions(self):
         if self.discrete:
             avail_actions = []
-            for agent_id in range(self.n_agents):
+            for agent_id in range(self.agent_num):
                 avail_agent = self.get_avail_agent_actions(agent_id)
                 avail_actions.append(avail_agent)
             return avail_actions
@@ -94,7 +93,7 @@ class PettingZooMPEEnv:
 
     def get_avail_agent_actions(self, agent_id):
         """Returns the available actions for agent_id"""
-        return [1] * self.action_space[agent_id].n
+        return [1] * self.action_spaces[agent_id].n
 
     def render(self):
         self.env.render()

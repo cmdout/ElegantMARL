@@ -5,7 +5,7 @@ import numpy as np
 from torch import Tensor
 from typing import Tuple, List
 
-from train.config import Config
+from HASAC_Train.config import Config
 
 
 class Evaluator:

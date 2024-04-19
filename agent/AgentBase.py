@@ -4,7 +4,7 @@ from typing import Tuple, Union
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 
-from train.config import Config
+from HASAC_Train.config import Config
 from buffer.replay_buffer import HAReplayBuffer as ReplayBuffer
 
 
